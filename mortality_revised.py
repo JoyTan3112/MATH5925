@@ -1,212 +1,257 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 mortality_revised.py
-Train/evaluate Logistic Regression & XGBoost on windowed ICU features.
-
-Usage:
-  python3 mortality_revised.py --data processed_icu_data_causal.csv \
-    --target "In-hospital_death" --id_cols RecordID window_start window_end
-
-Outputs:
-  - Console metrics (Accuracy, AUROC, AUPRC, Precision, Recall, F1, Brier)
-  - figures/confusion_matrix_logit.png
-  - figures/confusion_matrix_xgb.png
-  - test_predictions.csv
+- Logical de-duplication by patient/admission ID (keep last window)
+- 80/10/10 stratified split (test ≈ 10%)
+- 10-fold CV for Logistic Regression & XGBoost
+- Full metrics on held-out test set, confusion matrix figures, predictions CSV, metrics JSON
 """
 
-import argparse, os, sys, json
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import argparse
+import json
+import os
 from pathlib import Path
 
-from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    accuracy_score, roc_auc_score, average_precision_score,
-    precision_recall_fscore_support, confusion_matrix,
-    classification_report, brier_score_loss
+    accuracy_score, precision_recall_curve, roc_auc_score, average_precision_score,
+    precision_score, recall_score, f1_score, brier_score_loss, classification_report,
+    confusion_matrix
 )
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+
+# xgboost (sklearn API)
+from xgboost import XGBClassifier
 
 RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
 
-def load_data(path, target, id_cols):
-    df = pd.read_csv(path)
-    print(f"✅ Loaded: {path} | shape={df.shape}")
+# ---------- Utility: safe printing ----------
+def hr(title: str):
+    print("\n" + " " + title)
+    print("-" * (len(title) + 1))
 
-    # remove obvious non-feature columns
-    drop_cols = set(id_cols + [target])
-    # keep only numeric features
-    feature_cols = [c for c in df.columns
-                    if c not in drop_cols and pd.api.types.is_numeric_dtype(df[c])]
-    X = df[feature_cols].copy()
-    y = df[target].astype(int).values
+# ---------- Find columns ----------
+ID_CANDIDATES = ["icustay_id", "subject_id", "hadm_id", "RecordID", "patient_id"]
+TIME_CANDIDATES = ["event_time", "window_end_time", "end_time", "charttime", "timestamp"]
+TARGET_CANDIDATES = ["In-hospital_death", "In_hospital_death", "hospital_death", "mortality", "label", "y"]
 
-    # Basic sanity
-    if X.isnull().all(axis=1).any():
-        # Replace rows that are all-NaN with zeros (rare)
-        X = X.fillna(0)
-    else:
-        X = X.fillna(X.median(numeric_only=True))
+def find_first(cols, candidates):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
 
-    return df, X, y, feature_cols
+# ---------- Metrics ----------
+def full_metrics(y_true, y_prob, threshold=0.5, prefix=""):
+    y_hat = (y_prob >= threshold).astype(int)
 
-def report_class_balance(split_name, y):
-    n = len(y)
-    neg = int((y == 0).sum())
-    pos = int((y == 1).sum())
-    ratio = f"{neg}:{pos}" if pos > 0 else "inf"
-    print(f"🔢 Class balance [{split_name}]: neg={neg}, pos={pos} (ratio {ratio}, pos_rate={pos/n:.3f})")
-
-def pick_best_threshold(y_true, y_prob, beta=1.0):
-    """Search threshold maximizing F-score on validation set."""
-    best_t, best_f = 0.5, -1
-    for t in np.linspace(0.05, 0.95, 181):
-        y_pred = (y_prob >= t).astype(int)
-        p, r, f, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0, beta=beta)
-        if f > best_f:
-            best_f, best_t = f, t
-    return float(best_t)
-
-def metrics_suite(model_name, y_true, y_prob, y_pred, out_prefix):
-    acc = accuracy_score(y_true, y_pred)
+    acc = accuracy_score(y_true, y_hat)
     try:
         auroc = roc_auc_score(y_true, y_prob)
-    except ValueError:
-        auroc = np.nan
-    auprc = average_precision_score(y_true, y_prob)
-    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
+    except Exception:
+        auroc = float("nan")
+    try:
+        auprc = average_precision_score(y_true, y_prob)
+    except Exception:
+        auprc = float("nan")
+
+    prec = precision_score(y_true, y_hat, zero_division=0)
+    rec = recall_score(y_true, y_hat, zero_division=0)
+    f1 = f1_score(y_true, y_hat, zero_division=0)
     brier = brier_score_loss(y_true, y_prob)
 
-    print(f"[{model_name}] Accuracy={acc:.4f} | AUROC={auroc:.4f} | AUPRC={auprc:.4f} "
-          f"| Precision={p:.4f} | Recall={r:.4f} | F1={f1:.4f} | Brier={brier:.4f}")
-    print(classification_report(y_true, y_pred, digits=4))
-
-    # Confusion matrix figure
-    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
-    fig_dir = Path("figures")
-    fig_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(4.2, 4))
-    im = ax.imshow(cm, cmap="Blues")
-    for (i, j), v in np.ndenumerate(cm):
-        ax.text(j, i, str(v), va="center", ha="center", fontsize=12)
-    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
-    ax.set_xticks([0,1]); ax.set_yticks([0,1])
-    ax.set_title(f"{model_name} — Confusion Matrix")
-    plt.tight_layout()
-    png_path = fig_dir / f"confusion_matrix_{out_prefix}.png"
-    plt.savefig(png_path, dpi=180)
-    plt.close(fig)
-    print(f"🖼️  Saved confusion matrix → {png_path}")
+    print(f"[{prefix}] Accuracy={acc:.4f} | AUROC={auroc:.4f} | AUPRC={auprc:.4f} | "
+          f"Precision={prec:.4f} | Recall={rec:.4f} | F1={f1:.4f} | Brier={brier:.4f}")
+    print(classification_report(y_true, y_hat, digits=4))
 
     return {
-        "accuracy": acc, "auroc": float(auroc), "auprc": float(auprc),
-        "precision": float(p), "recall": float(r), "f1": float(f1),
-        "brier": float(brier), "cm": cm.tolist()
+        "accuracy": acc, "auroc": auroc, "auprc": auprc,
+        "precision": prec, "recall": rec, "f1": f1, "brier": brier,
+        "threshold": threshold
     }
 
+def youden_threshold(y_true, y_prob):
+    """Choose threshold on validation set via Youden J (TPR - FPR)."""
+    from sklearn.metrics import roc_curve
+    fpr, tpr, thr = roc_curve(y_true, y_prob)
+    j = tpr - fpr
+    return thr[np.argmax(j)]
+
+def save_confusion(y_true, y_prob, threshold, out_path):
+    y_hat = (y_prob >= threshold).astype(int)
+    cm = confusion_matrix(y_true, y_hat)
+    fig = plt.figure(figsize=(4, 4))
+    plt.imshow(cm, cmap="Blues")
+    plt.title("Confusion Matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    for (i, j), v in np.ndenumerate(cm):
+        plt.text(j, i, str(v), ha="center", va="center")
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+# ---------- Main ----------
 def main(args):
-    # ---- load
-    id_cols = args.id_cols or []
-    df, X, y, feature_cols = load_data(args.data, args.target, id_cols)
-    print(f"🧠 Using {len(feature_cols)} numeric features")
+    data_path = Path(args.data)
+    assert data_path.exists(), f"File not found: {data_path}"
 
-    # ---- split (train/val/test = 70/10/20)
-    X_train, X_tmp, y_train, y_tmp = train_test_split(
-        X, y, test_size=0.30, random_state=RANDOM_STATE, stratify=y
+    df = pd.read_csv(data_path)
+    print(f"✅ Loaded: {data_path.name} | shape={df.shape}")
+
+    cols = df.columns.tolist()
+    ID_COL = find_first(cols, ID_CANDIDATES)
+    TIME_COL = find_first(cols, TIME_CANDIDATES)
+    TARGET_COL = find_first(cols, TARGET_CANDIDATES)
+    assert TARGET_COL is not None, f"Target column not found; tried: {TARGET_CANDIDATES}"
+
+    # ---------- logical de-dup ----------
+    if ID_COL is not None:
+        before = df.shape[0]
+        if TIME_COL is not None:
+            df = df.sort_values([ID_COL, TIME_COL]).groupby(ID_COL, as_index=False, sort=False).tail(1)
+        else:
+            df = df.drop_duplicates(subset=[ID_COL], keep="last")
+        after = df.shape[0]
+        print(f"🔎 逻辑去重：按 {ID_COL} 聚合  {before} → {after} 行；唯一ID数：{df[ID_COL].nunique()}")
+    else:
+        print("⚠️ 未找到可用的ID列（icustay_id/subject_id/hadm_id/RecordID），跳过逻辑去重。")
+
+    # ---------- select numeric features ----------
+    ignore_cols = set([TARGET_COL])
+    if ID_COL: ignore_cols.add(ID_COL)
+    if TIME_COL: ignore_cols.add(TIME_COL)
+
+    num_cols = [c for c in df.columns
+                if c not in ignore_cols and pd.api.types.is_numeric_dtype(df[c])]
+
+    assert len(num_cols) > 0, "No numeric features found!"
+    print(f"🧠 Using {len(num_cols)} numeric features")
+
+    X = df[num_cols].values
+    y = df[TARGET_COL].values.astype(int)
+
+    # ---------- stratified 80/10/10 ----------
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y, test_size=0.10, random_state=RANDOM_STATE, stratify=y
     )
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_tmp, y_tmp, test_size=(2/3), random_state=RANDOM_STATE, stratify=y_tmp
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=1/9, random_state=RANDOM_STATE, stratify=y_trainval
     )
-    report_class_balance("train", y_train)
-    report_class_balance("valid", y_val)
-    report_class_balance("test",  y_test)
 
-    results = {}
+    def cnt(yv): return (np.sum(yv==0), np.sum(yv==1))
+    n0,n1 = cnt(y_train); print(f"🔢 Class balance [train]: neg={n0}, pos={n1} (ratio {n0}:{n1}, pos_rate={n1/(n0+n1):.3f})")
+    n0,n1 = cnt(y_val);   print(f"🔢 Class balance [valid]: neg={n0}, pos={n1} (ratio {n0}:{n1}, pos_rate={n1/(n0+n1):.3f})")
+    n0,n1 = cnt(y_test);  print(f"🔢 Class balance [test ]: neg={n0}, pos={n1} (ratio {n0}:{n1}, pos_rate={n1/(n0+n1):.3f})")
 
-    # =========================
-    # Logistic Regression
-    # =========================
-    logit = Pipeline([
-        ("scaler", StandardScaler(with_mean=False)),   # sparse-safe
-        ("clf", LogisticRegression(
-            max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE,
-            solver="lbfgs", n_jobs=None
-        ))
+    # ---------- pipelines ----------
+    # Logistic Regression: impute + scale + L2
+    logit = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+        ("clf", LogisticRegression(solver="lbfgs", max_iter=200, class_weight=None, random_state=RANDOM_STATE))
     ])
-    logit.fit(X_train, y_train)
-    val_prob = logit.predict_proba(X_val)[:,1]
-    t_logit = pick_best_threshold(y_val, val_prob, beta=1.0)
-    print(f"🔎 [Logit] chosen threshold (F1@val) = {t_logit:.3f}")
 
-    test_prob = logit.predict_proba(X_test)[:,1]
-    test_pred = (test_prob >= t_logit).astype(int)
-    results["logit"] = metrics_suite("Logit", y_test, test_prob, test_pred, "logit")
-
-    # =========================
-    # XGBoost
-    # =========================
-    try:
-        import xgboost as xgb
-    except Exception as e:
-        print("❌ xgboost is not installed. Please `pip install xgboost`.")
-        sys.exit(1)
-
-    # scale_pos_weight = neg/pos on TRAIN
-    neg = max(1, int((y_train == 0).sum()))
-    pos = max(1, int((y_train == 1).sum()))
-    spw = neg / pos
-    # ⚙️ Compute class imbalance weight
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    print(f"🎄 XGBoost scale_pos_weight (neg/pos on train) = {scale_pos_weight:.2f}")
-
-    # ✅ Initialize and train XGBoost
-    xgb_clf = XGBClassifier(
-        eval_metric='logloss',
+    # XGBoost (sklearn API). 不传 early_stopping 避免版本差异；先把 CV 做好
+    neg, pos = np.sum(y_train==0), np.sum(y_train==1)
+    scale_pos_weight = (neg / max(pos, 1)) if pos > 0 else 1.0
+    print(f"🌲 XGBoost scale_pos_weight (neg/pos on train) = {scale_pos_weight:.2f}")
+    xgb = XGBClassifier(
         n_estimators=500,
         learning_rate=0.05,
         max_depth=4,
         subsample=0.8,
         colsample_bytree=0.8,
+        reg_lambda=1.0,
+        tree_method="hist",
+        random_state=RANDOM_STATE,
         scale_pos_weight=scale_pos_weight,
-        use_label_encoder=False
+        n_jobs=-1,
+        use_label_encoder=False,
+        eval_metric="logloss"
     )
 
-    xgb_clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    # ---------- 10-fold CV ----------
+    hr("10-fold Cross-Validation on TRAIN")
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_STATE)
+    cv_acc_log = cross_val_score(logit, X_train, y_train, cv=skf, scoring="accuracy")
+    cv_auc_log = cross_val_score(logit, X_train, y_train, cv=skf, scoring="roc_auc")
+    print(f"[Logit] 10-fold CV Accuracy: mean={cv_acc_log.mean():.4f} ± {cv_acc_log.std():.4f}")
+    print(f"[Logit] 10-fold CV AUROC:    mean={cv_auc_log.mean():.4f} ± {cv_auc_log.std():.4f}")
 
-    val_prob_xgb = xgb_clf.predict_proba(X_val)[:,1]
-    t_xgb = pick_best_threshold(y_val, val_prob_xgb, beta=1.0)
-    print(f"🔎 [XGBoost] chosen threshold (F1@val) = {t_xgb:.3f}")
+    cv_acc_xgb = cross_val_score(xgb, X_train, y_train, cv=skf, scoring="accuracy")
+    cv_auc_xgb = cross_val_score(xgb, X_train, y_train, cv=skf, scoring="roc_auc")
+    print(f"[XGB ] 10-fold CV Accuracy: mean={cv_acc_xgb.mean():.4f} ± {cv_acc_xgb.std():.4f}")
+    print(f"[XGB ] 10-fold CV AUROC:    mean={cv_auc_xgb.mean():.4f} ± {cv_auc_xgb.std():.4f}")
 
-    test_prob_xgb = xgb_clf.predict_proba(X_test)[:,1]
-    test_pred_xgb = (test_prob_xgb >= t_xgb).astype(int)
-    results["xgb"] = metrics_suite("XGBoost", y_test, test_prob_xgb, test_pred_xgb, "xgb")
+    # ---------- Fit on TRAIN, choose threshold on VAL, evaluate on TEST ----------
+    out_dir = Path("figures"); out_dir.mkdir(exist_ok=True, parents=True)
 
-    # ---- save predictions
-    out_pred = pd.DataFrame({
-        "y_true": y_test,
-        "logit_prob": test_prob,
-        "logit_pred": test_pred,
-        "xgb_prob": test_prob_xgb,
-        "xgb_pred": test_pred_xgb
+    # Logistic
+    hr("Logistic Regression (Val threshold -> Test metrics)")
+    logit.fit(X_train, y_train)
+    val_prob_log = logit.predict_proba(X_val)[:, 1]
+    th_log = youden_threshold(y_val, val_prob_log)
+    print(f"[Logit] chosen threshold (F1/Youden on VAL) = {th_log:.3f}")
+
+    test_prob_log = logit.predict_proba(X_test)[:, 1]
+    m_log = full_metrics(y_test, test_prob_log, threshold=th_log, prefix="Logit")
+    save_confusion(y_test, test_prob_log, th_log, out_dir / "confusion_matrix_logit.png")
+
+    # XGBoost
+    hr("XGBoost (Val threshold -> Test metrics)")
+    xgb.fit(X_train, y_train, verbose=False)
+    val_prob_xgb = xgb.predict_proba(X_val)[:, 1]
+    th_xgb = youden_threshold(y_val, val_prob_xgb)
+    print(f"[XGBoost] chosen threshold (F1@VAL) = {th_xgb:.3f}")
+
+    test_prob_xgb = xgb.predict_proba(X_test)[:, 1]
+    m_xgb = full_metrics(y_test, test_prob_xgb, threshold=th_xgb, prefix="XGBoost")
+    save_confusion(y_test, test_prob_xgb, th_xgb, out_dir / "confusion_matrix_xgb.png")
+
+    # ---------- Save predictions & metrics ----------
+    pred_df = pd.DataFrame({
+        "y_test": y_test,
+        "logit_prob": test_prob_log,
+        "xgb_prob": test_prob_xgb
     })
-    out_pred.to_csv("test_predictions.csv", index=False)
+    pred_df.to_csv("test_predictions.csv", index=False)
     print("💾 Saved predictions → test_predictions.csv")
 
-    # ---- save a small JSON summary
+    metrics = {
+        "cv": {
+            "logit": {"acc_mean": float(cv_acc_log.mean()), "acc_std": float(cv_acc_log.std()),
+                      "auc_mean": float(cv_auc_log.mean()), "auc_std": float(cv_auc_log.std())},
+            "xgb":   {"acc_mean": float(cv_acc_xgb.mean()), "acc_std": float(cv_acc_xgb.std()),
+                      "auc_mean": float(cv_auc_xgb.mean()), "auc_std": float(cv_auc_xgb.std())},
+        },
+        "test": {"logit": m_log, "xgb": m_xgb},
+        "meta": {
+            "n_total": int(df.shape[0]),
+            "n_features": int(len(num_cols)),
+            "target": TARGET_COL,
+            "id_col": ID_COL,
+            "time_col": TIME_COL
+        }
+    }
     with open("metrics_summary.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print("📑 Saved metrics summary → metrics_summary.json")
+        json.dump(metrics, f, indent=2)
+    print("💾 Saved metrics summary → metrics_summary.json")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True, help="processed_icu_data_causal.csv")
-    parser.add_argument("--target", default="In-hospital_death")
-    parser.add_argument("--id_cols", nargs="*", default=["RecordID","window_start","window_end"],
-                        help="ID/time-ish columns to drop from features if present")
+    parser.add_argument("--data", type=str, required=True, help="Path to input CSV")
     args = parser.parse_args()
     main(args)
